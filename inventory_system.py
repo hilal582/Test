@@ -773,7 +773,9 @@ class InventoryApp:
         
         # Display confidence level from AI
         confidence = analysis_result.get('confidence', 0)
-        conf_color = '#27ae60' if confidence > 80 else ('#f39c12' if confidence > 60 else '#e74c3c')
+        conf = float(re.sub(r'[^\d.]', '', str(confidence))) if confidence else 0.0
+        conf_color = '#27ae60' if conf > 80 else ('#f39c12' if conf > 60 else '#e74c3c')
+
         
         conf_label = tk.Label(results_frame, text=f"AI Confidence: {confidence}%", 
                              font=('Arial', 11, 'bold'), bg='#f8f9fa', fg=conf_color)
@@ -1027,6 +1029,7 @@ class InventoryApp:
                 try:
                     price = float(price_str)
                     if price <= 0:
+                        
                         raise ValueError("Price must be greater than 0.")
                 except ValueError:
                     raise ValueError("Price must be a valid number.")
