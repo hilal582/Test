@@ -17,6 +17,8 @@ import io
 import threading
 import time
 import re # Import regex for cleaning AI output
+from queue import Queue # Import Queue for thread-safe communication
+from difflib import SequenceMatcher # For fuzzy string matching
 
 # Gemini API Configuration
 GEMINI_API_KEY = "AIzaSyB_-U6iE2FZgiOBPSWsjS6ekCYY2ti5J2g"
@@ -32,14 +34,14 @@ def create_database():
     # Products Table - Main inventory storage
     # Added barcode, category, and description columns
     c.execute('''CREATE TABLE IF NOT EXISTS products
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 name TEXT UNIQUE NOT NULL,
-                 price REAL NOT NULL CHECK(price > 0),
-                 quantity INTEGER NOT NULL CHECK(quantity >= 0),
-                 min_stock INTEGER NOT NULL CHECK(min_stock >= 0),
-                 barcode TEXT UNIQUE,
-                 category TEXT,
-                 description TEXT,
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                 name TEXT UNIQUE NOT NULL,\
+                 price REAL NOT NULL CHECK(price > 0),\
+                 quantity INTEGER NOT NULL CHECK(quantity >= 0),\
+                 min_stock INTEGER NOT NULL CHECK(min_stock >= 0),\
+                 barcode TEXT UNIQUE,\
+                 category TEXT,\
+                 description TEXT,\
                  created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
                  
     # Sales Table - Transaction history
@@ -88,7 +90,7 @@ class GeminiAI:
                             {
                                 "text": """Analyze this product image and provide the following information in JSON format:
                                 {
-                                    "name": "Product name",
+                                    "name": "Product name (include brand if clearly visible)",
                                     "category": "Product category",
                                     "estimated_price": "Estimated price in USD (number only)",
                                     "description": "Brief product description",
@@ -102,7 +104,7 @@ class GeminiAI:
                                 - For clothing: min_stock should be 10-30 depending on seasonality and size variations.
                                 - For household items: min_stock should be 5-25 depending on usage frequency.
                                 - Price should be a realistic market price estimate based on the visual.
-                                - Be specific with product names (include brand if visible, e.g., "Coca-Cola 12oz Can")."""
+                                - Be specific with product names (include brand if visible, e.g., "Coca-Cola 12oz Can", "Mai Dubai Drinking Water Bottle")."""
                             },
                             {
                                 "inline_data": {
@@ -397,10 +399,20 @@ class InventoryApp:
         self.root.geometry("1200x800")
         self.root.configure(bg='#f0f0f0')
         
+        # Centralized database connection and cursor
+        # It's crucial to manage this connection across threads to avoid 'database is locked'
+        self.db_conn = sqlite3.connect('inventory.db', check_same_thread=False)
+        self.db_cursor = self.db_conn.cursor()
+        self.db_lock = threading.Lock() # Mutex for thread-safe database access
+        
         # Initialize AI and scanner helper classes
         self.gemini_ai = GeminiAI()
         self.barcode_scanner = BarcodeScanner()
         self.camera_capture = CameraCapture()
+        
+        # Queue for thread-safe communication
+        self.barcode_queue = Queue() 
+        self.root.after(100, self.process_barcode_queue) # Start checking the queue
         
         # Style configuration for a modern look
         self.setup_styles()
@@ -409,6 +421,74 @@ class InventoryApp:
         self.create_widgets()
         self.refresh_table() # Populate the product table on startup
         
+        # Bind the close event to clean up database connection
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def _normalize_product_name(self, name):
+        """
+        Normalizes a product name for comparison by lowercasing,
+        removing common generic terms, and extra spaces.
+        """
+        if not name:
+            return ""
+        name = name.lower()
+        # Remove common generic terms that might vary but mean the same product
+        generic_terms = ["drinking water", "bottled water", "bottle", "can", "pack", "item"]
+        for term in generic_terms:
+            name = name.replace(term, "")
+        # Remove special characters and extra spaces
+        name = re.sub(r'[^a-z0-9\s]', '', name)
+        name = re.sub(r'\s+', ' ', name).strip()
+        return name
+
+    def _find_similar_product(self, new_product_name, min_similarity=0.7):
+        """
+        Searches the database for products with names similar to the new_product_name.
+        Returns the most similar product (id, name, quantity, price) or None.
+        """
+        normalized_new_name = self._normalize_product_name(new_product_name)
+        
+        best_match = None
+        highest_similarity = 0.0
+
+        with self.db_lock: # Acquire lock for database read
+            self.db_cursor.execute("SELECT id, name, quantity, price FROM products")
+            all_products = self.db_cursor.fetchall()
+        
+        for product_id, db_name, db_quantity, db_price in all_products:
+            normalized_db_name = self._normalize_product_name(db_name)
+            
+            # Calculate string similarity ratio
+            similarity = SequenceMatcher(None, normalized_new_name, normalized_db_name).ratio()
+            
+            # Check for strong keyword overlap as an alternative/additional check
+            new_keywords = set(normalized_new_name.split())
+            db_keywords = set(normalized_db_name.split())
+            common_keywords = len(new_keywords.intersection(db_keywords))
+            
+            # A higher threshold for common keywords if direct similarity is borderline
+            if similarity >= min_similarity:
+                if similarity > highest_similarity:
+                    highest_similarity = similarity
+                    best_match = (product_id, db_name, db_quantity, db_price, similarity)
+            elif common_keywords >= 2 and len(new_keywords) >= 2 and len(db_keywords) >= 2: # At least 2 common keywords for a "smart" match
+                # If product names are short, even 2 common keywords can be significant
+                if (common_keywords / max(len(new_keywords), len(db_keywords))) > 0.6: # High proportion of common words
+                     if (common_keywords / max(len(new_keywords), len(db_keywords))) > highest_similarity: # Use this as similarity if better
+                        highest_similarity = (common_keywords / max(len(new_keywords), len(db_keywords)))
+                        best_match = (product_id, db_name, db_quantity, db_price, highest_similarity)
+
+
+        return best_match if best_match and best_match[4] >= min_similarity else None
+
+
+    def on_closing(self):
+        """Handle window closing event to ensure database connection is closed."""
+        if self.db_conn:
+            self.db_conn.close()
+            print("Database connection closed.")
+        self.root.destroy()
+
     def setup_styles(self):
         """Configure modern UI styling for ttk widgets"""
         style = ttk.Style()
@@ -416,7 +496,7 @@ class InventoryApp:
         
         # Configure Treeview colors and font
         style.configure("Treeview", background="#ffffff", foreground="#000000", 
-                       fieldbackground="#ffffff",  font=('Arial', 10))
+                       fieldbackground="#ffffff", font=('Arial', 10))
         style.configure("Treeview.Heading", font=('Arial', 11, 'bold'))
         
         # Configure button styles for a consistent look
@@ -495,7 +575,6 @@ class InventoryApp:
             ("➕ Add Product (Manual)", self.open_add_window, '#27ae60'),
             ("📷 AI Add Product (Photo)", self.ai_add_product, '#e67e22'), # AI integration
             ("📱 Scan Add Product (Barcode)", self.scan_add_product, '#f39c12'), # Barcode integration
-            ("🗑️ Remove Product", self.remove_product, '#e74c3c'),
         ]
         
         # Create and pack buttons for Row 1
@@ -506,21 +585,37 @@ class InventoryApp:
             btn.pack(side=tk.LEFT, padx=6)
             self.add_hover_effect(btn, color) # Add hover effect
         
-        # Second row of buttons for sales and reports
+        # Second row of buttons for product editing and removal
         btn_row2 = tk.Frame(btn_frame, bg='#f0f0f0')
         btn_row2.pack(fill=tk.X, pady=2, expand=True) # Expand to center buttons
         
-        # Button configurations for Row 2
         buttons_row2 = [
+            ("✏️ Edit Product", self.edit_product, '#3498db'), # New Edit Product button
+            ("🗑️ Remove Product", self.remove_product, '#e74c3c'),
+        ]
+        
+        for text, command, color in buttons_row2:
+            btn = tk.Button(btn_row2, text=text, command=command, 
+                           font=('Arial', 9, 'bold'), fg='white', bg=color,
+                           padx=12, pady=6, relief=tk.FLAT, cursor='hand2')
+            btn.pack(side=tk.LEFT, padx=6)
+            self.add_hover_effect(btn, color) # Add hover effect
+
+        # Third row of buttons for sales and reports
+        btn_row3 = tk.Frame(btn_frame, bg='#f0f0f0')
+        btn_row3.pack(fill=tk.X, pady=2, expand=True) # Expand to center buttons
+        
+        # Button configurations for Row 3
+        buttons_row3 = [
             ("💰 Record Sale (Manual)", self.record_sale, '#3498db'),
             ("📱 Quick Scan Sale (Barcode)", self.quick_scan_sale, '#9b59b6'), # New Quick Scan Sale button
             ("⚠️ Low Stock Alert", self.check_low_stock, '#f39c12'),
             ("📊 Generate Report", self.generate_report, '#34495e')
         ]
         
-        # Create and pack buttons for Row 2
-        for text, command, color in buttons_row2:
-            btn = tk.Button(btn_row2, text=text, command=command, 
+        # Create and pack buttons for Row 3
+        for text, command, color in buttons_row3:
+            btn = tk.Button(btn_row3, text=text, command=command, 
                            font=('Arial', 9, 'bold'), fg='white', bg=color,
                            padx=12, pady=6, relief=tk.FLAT, cursor='hand2')
             btn.pack(side=tk.LEFT, padx=6)
@@ -548,7 +643,7 @@ class InventoryApp:
         color_map = {
             '#27ae60': '#229954', # Add Product (Manual)
             '#e74c3c': '#c0392b', # Remove Product
-            '#3498db': '#2980b9', # Record Sale (Manual)
+            '#3498db': '#2980b9', # Record Sale (Manual), Edit Product
             '#f39c12': '#e67e22', # Low Stock Alert, Scan Add Product
             '#9b59b6': '#8e44ad', # Generate Report, Quick Scan Sale
             '#e67e22': '#d35400', # AI Add Product (Photo)
@@ -650,14 +745,10 @@ class InventoryApp:
                     raise ValueError("Minimum stock must be a valid whole number.")
                 
                 # Database insertion
-                conn = sqlite3.connect('inventory.db')
-                c = conn.cursor()
-                
-                # Insert into products table, including new fields
-                c.execute("INSERT INTO products (name, price, quantity, min_stock, category, description) VALUES (?, ?, ?, ?, ?, ?)",
-                         (name, price, quantity, min_stock, category, description))
-                conn.commit()
-                conn.close()
+                with self.db_lock: # Use lock for thread-safe DB access
+                    self.db_cursor.execute("INSERT INTO products (name, price, quantity, min_stock, category, description) VALUES (?, ?, ?, ?, ?, ?)",
+                                 (name, price, quantity, min_stock, category, description))
+                    self.db_conn.commit()
                 
                 # Success feedback
                 messagebox.showinfo("Success", f"Product '{name}' added successfully!")
@@ -737,25 +828,26 @@ class InventoryApp:
         # Helper function to safely convert to a numeric string for display in Entry widgets
         def _safe_numeric_str(value, default_val, is_integer=False):
             try:
-                # Convert to string, then remove any non-numeric characters except for a single decimal point (for float) or just digits (for int)
-                # Also strip leading/trailing whitespace
+                # Convert value to string and strip whitespace
                 s_value = str(value).strip()
                 
-                if is_integer:
-                    cleaned_value = re.sub(r'[^\d]', '', s_value)
-                else:
-                    # Allow one decimal point for float
-                    parts = cleaned_value = re.sub(r'[^\d.]', '', s_value).split('.', 1)
-                    if len(parts) > 1: # If there's a decimal point
-                        cleaned_value = parts[0] + '.' + parts[1]
-                    else:
-                        cleaned_value = parts[0]
+                # Filter out non-numeric characters, but allow a single decimal point for floats
+                cleaned_value_chars = []
+                has_decimal = False
+                for char in s_value:
+                    if char.isdigit():
+                        cleaned_value_chars.append(char)
+                    elif char == '.' and not is_integer and not has_decimal:
+                        cleaned_value_chars.append(char)
+                        has_decimal = True
+                cleaned_value = "".join(cleaned_value_chars)
 
                 if not cleaned_value: # Handle empty string after cleaning
                     return str(default_val)
                 
                 if is_integer:
-                    return str(int(float(cleaned_value))) # Convert to float first, then int for robustness
+                    # Safely convert to int
+                    return str(int(float(cleaned_value))) 
                 else:
                     return str(float(cleaned_value))
             except (ValueError, TypeError):
@@ -773,8 +865,9 @@ class InventoryApp:
         
         # Display confidence level from AI
         confidence = analysis_result.get('confidence', 0)
-        conf = float(re.sub(r'[^\d.]', '', str(confidence))) if confidence else 0.0
-        conf_color = '#27ae60' if conf > 80 else ('#f39c12' if conf > 60 else '#e74c3c')
+        # Ensure confidence is treated as a string, then convert to float
+        conf_val = float(_safe_numeric_str(confidence, 0.0))
+        conf_color = '#27ae60' if conf_val > 80 else ('#f39c12' if conf_val > 60 else '#e74c3c')
 
         
         conf_label = tk.Label(results_frame, text=f"AI Confidence: {confidence}%", 
@@ -824,7 +917,10 @@ class InventoryApp:
         form_frame.grid_columnconfigure(1, weight=1) # Allow second column (entries) to expand
         
         def validate_and_add_ai_product():
-            """Validates input fields and adds the AI-analyzed product to the database."""
+            """
+            Validates input fields and adds the AI-analyzed product to the database.
+            If a product with a similar name exists, it prompts to update quantity instead.
+            """
             try:
                 # Retrieve values from the entry/text widgets
                 name = entries['name'].get().strip()
@@ -842,7 +938,7 @@ class InventoryApp:
                 
                 try:
                     # Clean the string before converting to float
-                    price = float(re.sub(r'[^\d.]', '', price_str))
+                    price = float(_safe_numeric_str(price_str, 0.0))
                     if price <= 0:
                         raise ValueError("Price must be greater than 0.")
                 except ValueError:
@@ -850,7 +946,7 @@ class InventoryApp:
                 
                 try:
                     # Clean the string before converting to int (only digits)
-                    quantity = int(re.sub(r'[^\d]', '', quantity_str))
+                    quantity = int(_safe_numeric_str(quantity_str, 0, is_integer=True))
                     if quantity < 0:
                         raise ValueError("Quantity cannot be negative.")
                 except ValueError:
@@ -858,30 +954,59 @@ class InventoryApp:
                 
                 try:
                     # Clean the string before converting to int (only digits)
-                    min_stock = int(re.sub(r'[^\d]', '', min_stock_str)) 
+                    min_stock = int(_safe_numeric_str(min_stock_str, 0, is_integer=True)) 
                     if min_stock < 0:
                         raise ValueError("Minimum stock cannot be negative.")
                 except ValueError:
                     raise ValueError("Minimum stock must be a valid whole number.")
                 
-                # Database insertion
-                conn = sqlite3.connect('inventory.db')
-                c = conn.cursor()
+                # --- Intelligent AI Duplicate Check for AI-added products ---
+                # Check for existing product by similar name
+                similar_product_match = self._find_similar_product(name)
                 
-                # Insert into products table (barcode is None for AI-added products unless explicitly added)
-                c.execute("""INSERT INTO products (name, price, quantity, min_stock, category, description, barcode) 
-                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                         (name, price, quantity, min_stock, category, description, None)) # Barcode is None for AI-added
-                conn.commit()
-                conn.close()
+                if similar_product_match:
+                    product_id, existing_name, current_quantity, existing_price, similarity_score = similar_product_match
+                    
+                    response = messagebox.askyesno(
+                        "Product Already Exists (Similar Name)",
+                        f"A product named '{existing_name}' (Similarity: {similarity_score:.2f}) already exists with quantity {current_quantity} and price ${existing_price:.2f}.\n\n"
+                        f"Do you want to add {quantity} to its stock and update its price to ${price:.2f} (from AI)?\n"
+                        f"Selecting 'No' will prompt you to add this as a new, distinct product."
+                    )
+                    if response:
+                        # Update quantity and potentially price/category/description
+                        with self.db_lock: # Acquire lock for database write
+                            self.db_cursor.execute(
+                                "UPDATE products SET quantity = quantity + ?, price = ?, category = ?, description = ? WHERE id = ?", 
+                                (quantity, price, category, description, product_id)
+                            )
+                            self.db_conn.commit()
+                        messagebox.showinfo("Quantity & Details Updated", 
+                                           f"Quantity for '{existing_name}' increased by {quantity} and details updated. New total: {current_quantity + quantity}.")
+                        ai_window.destroy()
+                        self.refresh_table()
+                        self.update_status(f"Updated existing product via AI: {existing_name} (+{quantity})")
+                        return # Exit function after updating
+                    # If user chose 'No', they will proceed to manual add for a new distinct product below
+                    
+                # If no similar product found or user chose not to merge, proceed with insertion
+                with self.db_lock: # Acquire lock for database write
+                    self.db_cursor.execute("""INSERT INTO products (name, price, quantity, min_stock, category, description, barcode) 
+                                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                                      (name, price, quantity, min_stock, category, description, None)) # Barcode is None for AI-added
+                    self.db_conn.commit()
                 
                 messagebox.showinfo("Success", f"AI-analyzed product '{name}' added successfully!")
                 ai_window.destroy()
                 self.refresh_table()
                 self.update_status(f"AI-added product: {name}")
                 
-            except sqlite3.IntegrityError:
-                messagebox.showerror("Error", "Product with this name already exists!")
+            except sqlite3.IntegrityError as e:
+                # Catch specific name unique constraint error if it still occurs
+                if "UNIQUE constraint failed: products.name" in str(e):
+                    messagebox.showerror("Error", "A product with this exact name already exists. Please consider using 'Retake Photo' or 'Cancel' and then editing the existing product.")
+                else:
+                    messagebox.showerror("Database Error", f"Failed to add product due to database error: {str(e)}")
             except ValueError as e:
                 messagebox.showerror("Validation Error", str(e))
             except Exception as e:
@@ -910,43 +1035,125 @@ class InventoryApp:
         
         entries['quantity'].focus_set() # Focus on quantity field for immediate input
     
+    def process_barcode_queue(self):
+        """
+        Processes items in the barcode queue. This method runs on the main Tkinter thread.
+        """
+        try:
+            while not self.barcode_queue.empty():
+                barcode_data = self.barcode_queue.get_nowait()
+                # Determine the type of data (error or successful scan)
+                if isinstance(barcode_data, dict) and 'error' in barcode_data:
+                    messagebox.showerror("Barcode Scan Error", barcode_data['error'])
+                    self.update_status("Barcode scan failed.")
+                else:
+                    self._handle_scanned_barcode(barcode_data['barcode'], barcode_data['product_info'])
+        except Exception as e:
+            messagebox.showerror("Queue Processing Error", f"Error processing barcode queue: {e}")
+        finally:
+            self.root.after(100, self.process_barcode_queue) # Schedule itself to run again
+            
     def scan_add_product(self):
-        """Initiates barcode scanning to add a new product."""
-        def scan_and_lookup():
+        """Initiates barcode scanning in a separate thread."""
+        def scan_and_lookup_thread():
             try:
                 self.update_status("Opening camera for barcode scanning...")
-                
-                # Scan barcode using the BarcodeScanner class
                 barcodes, status = self.barcode_scanner.scan_barcode_from_camera()
-                if not barcodes: # If no barcode was scanned or cancelled
-                    messagebox.showwarning("Scan Failed", status)
-                    self.update_status("Barcode scan cancelled or failed.")
-                    return
                 
-                barcode = barcodes[0] # Take the first detected barcode
+                if not barcodes:
+                    self.barcode_queue.put({'error': status})
+                    return
+
+                barcode = barcodes[0]
                 self.update_status(f"Looking up product information for barcode: {barcode}...")
-                
-                # Get product info from online database using the barcode
-                product_info = self.barcode_scanner.get_product_info_from_barcode(barcode)
-                
-                if not product_info.get('found', False):
-                    messagebox.showwarning("Product Not Found", 
-                                         f"Could not find product information for barcode: {barcode}\n"
-                                         f"Error: {product_info.get('error', 'Unknown error')}")
-                    self.update_status("Product lookup failed for barcode.")
-                    return
-                
-                # Display the found product information in a new window for confirmation
-                self.show_barcode_product_window(barcode, product_info)
-                self.update_status(f"Product information found for barcode: {barcode}.")
-                
+
+                existing_product_by_barcode = None
+                with self.db_lock: # Acquire lock for database read
+                    self.db_cursor.execute("SELECT id, name, quantity, price FROM products WHERE barcode = ?", (barcode,))
+                    existing_product_by_barcode = self.db_cursor.fetchone()
+
+                if existing_product_by_barcode:
+                    # Pass existing product info to the main thread for quantity update
+                    self.barcode_queue.put({'barcode': barcode, 'product_info': existing_product_by_barcode})
+                else:
+                    # Product not found by barcode in our DB, try online lookup
+                    product_info_from_api = self.barcode_scanner.get_product_info_from_barcode(barcode)
+                    
+                    if not product_info_from_api.get('found', False):
+                        self.barcode_queue.put({'error': f"Could not find product information for barcode: {barcode}\nError: {product_info_from_api.get('error', 'Unknown error')}"})
+                    else:
+                        # --- Intelligent AI Duplicate Check for Barcode Scans ---
+                        # Check if this product (from barcode API) is similar to an *AI-added* existing product
+                        # Use the name from the barcode API for similarity checking
+                        scanned_product_name = product_info_from_api.get('name', '')
+                        similar_product_match = self._find_similar_product(scanned_product_name, min_similarity=0.75) # Higher similarity for barcode to AI merge
+                        
+                        if similar_product_match:
+                            product_id, existing_name, current_quantity, existing_price, similarity_score = similar_product_match
+                            
+                            # Prompt user to merge with existing AI-added product
+                            response = messagebox.askyesno(
+                                "Product Already Exists (Similar Name/Brand)",
+                                f"The scanned product '{scanned_product_name}' (Barcode: {barcode}) is similar to existing product '{existing_name}' (Similarity: {similarity_score:.2f}).\n"
+                                f"Current quantity: {current_quantity}. Existing price: ${existing_price:.2f}.\n\n"
+                                f"Do you want to add 1 to its stock and assign this barcode to it?\n"
+                                f"Selecting 'No' will prompt you to add this as a new product."
+                            )
+                            if response:
+                                with self.db_lock: # Acquire lock for database write
+                                    self.db_cursor.execute(
+                                        "UPDATE products SET quantity = quantity + 1, barcode = ? WHERE id = ?",
+                                        (barcode, product_id) # Assign the barcode to the existing product
+                                    )
+                                    self.db_conn.commit()
+                                self.barcode_queue.put({'success_message': f"Quantity for '{existing_name}' increased by 1 and barcode assigned. New total: {current_quantity + 1}."})
+                                return
+                        
+                        # If no barcode match in DB and no similar AI product match (or user declined merge)
+                        self.barcode_queue.put({'barcode': barcode, 'product_info': product_info_from_api})
+
             except Exception as e:
-                messagebox.showerror("Error", f"Barcode scanning and lookup failed: {str(e)}")
-                self.update_status("Barcode scanning process failed.")
-        
-        # Run in a separate thread to avoid freezing the main UI
-        threading.Thread(target=scan_and_lookup, daemon=True).start()
-    
+                self.barcode_queue.put({'error': f"Barcode scanning and lookup failed: {str(e)}"})
+
+        # Start the scanning and lookup in a separate thread
+        threading.Thread(target=scan_and_lookup_thread, daemon=True).start()
+
+    def _handle_scanned_barcode(self, barcode, product_info):
+        """
+        Handles the scanned barcode data on the main Tkinter thread.
+        This function is called by process_barcode_queue.
+        """
+        if isinstance(product_info, tuple): # It's an existing product (id, name, quantity, price) from our DB
+            product_id, product_name, current_quantity, current_price = product_info
+            response = simpledialog.askinteger("Product Exists", 
+                                              f"Product '{product_name}' (Barcode: {barcode}) already exists.\n"
+                                              f"Current quantity: {current_quantity}.\n"
+                                              f"Enter quantity to add:",
+                                              initialvalue=1,
+                                              minvalue=1)
+            if response is not None:
+                qty_to_add = response
+                try:
+                    with self.db_lock: # Acquire lock for database write
+                        self.db_cursor.execute("UPDATE products SET quantity = quantity + ? WHERE id = ?", 
+                                             (qty_to_add, product_id))
+                        self.db_conn.commit()
+                    messagebox.showinfo("Quantity Updated", 
+                                       f"Quantity for '{product_name}' increased by {qty_to_add}. New total: {current_quantity + qty_to_add}.")
+                    self.refresh_table()
+                    self.update_status(f"Updated quantity for: {product_name} (+{qty_to_add})")
+                except Exception as e:
+                    messagebox.showerror("Update Error", f"Failed to update quantity: {str(e)}")
+            else:
+                self.update_status("Quantity update cancelled.")
+        elif isinstance(product_info, dict) and 'success_message' in product_info:
+            messagebox.showinfo("Success", product_info['success_message'])
+            self.refresh_table()
+            self.update_status(product_info['success_message'])
+        else: # It's new product info from online lookup (and no similar product found or merged)
+            self.show_barcode_product_window(barcode, product_info)
+            self.update_status(f"Product information found for barcode: {barcode}.")
+
     def show_barcode_product_window(self, barcode, product_info):
         """
         Shows a window with product information retrieved via barcode,
@@ -1000,7 +1207,7 @@ class InventoryApp:
             else:
                 entry = tk.Entry(form_frame, font=('Arial', 11), width=25, 
                                relief=tk.FLAT, bd=5)
-                entry.grid(row=i, column=1, pady=8, sticky='ew')
+                entry.grid(row=i, column=1, pady=8, padx=(10, 0), sticky='ew')
                 entry.insert(0, default_value)
                 entries[field_name] = entry
                 
@@ -1048,25 +1255,12 @@ class InventoryApp:
                 except ValueError:
                     raise ValueError("Minimum stock must be a valid whole number.")
                 
-                # Check if barcode already exists in the database
-                conn = sqlite3.connect('inventory.db')
-                c = conn.cursor()
-                c.execute("SELECT id FROM products WHERE barcode = ?", (barcode,))
-                existing_product = c.fetchone()
-                
-                if existing_product:
-                    messagebox.showwarning("Product Exists", f"Product with barcode '{barcode}' already exists. "
-                                                               "Please update existing product quantity instead.")
-                    conn.close()
-                    barcode_window.destroy()
-                    return
-                
-                # Insert into products table
-                c.execute("""INSERT INTO products (name, price, quantity, min_stock, barcode, category, description) 
-                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                         (name, price, quantity, min_stock, barcode, category, description))
-                conn.commit()
-                conn.close()
+                # Database insertion
+                with self.db_lock: # Acquire lock for database write
+                    self.db_cursor.execute("""INSERT INTO products (name, price, quantity, min_stock, barcode, category, description) 
+                                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                                      (name, price, quantity, min_stock, barcode, category, description))
+                    self.db_conn.commit()
                 
                 messagebox.showinfo("Success", f"Product '{name}' (Barcode: {barcode}) added successfully!")
                 barcode_window.destroy()
@@ -1074,7 +1268,7 @@ class InventoryApp:
                 self.update_status(f"Added product by barcode: {name}")
                 
             except sqlite3.IntegrityError as sqle:
-                # This could happen if name is also unique and conflicts
+                # This should now ideally only catch unique name conflicts if barcode path is handled
                 if "UNIQUE constraint failed: products.name" in str(sqle):
                     messagebox.showerror("Error", "Product name already exists! Please edit the name or update the existing product.")
                 else:
@@ -1107,6 +1301,138 @@ class InventoryApp:
         
         entries['quantity'].focus_set() # Focus on quantity field
     
+    def edit_product(self):
+        """Opens a new window to edit selected product details."""
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showwarning("No Selection", "Please select a product to edit from the list.")
+            return
+
+        item = self.tree.item(selected[0])
+        product_id = item['values'][0]
+
+        product_data = None
+        with self.db_lock: # Acquire lock for database read
+            self.db_cursor.execute("SELECT name, price, quantity, min_stock, category, description FROM products WHERE id = ?", (product_id,))
+            product_data = self.db_cursor.fetchone()
+
+        if not product_data:
+            messagebox.showerror("Error", "Product not found in database.")
+            return
+
+        name, price, quantity, min_stock, category, description = product_data
+
+        edit_window = tk.Toplevel(self.root)
+        edit_window.title(f"Edit Product: {name}")
+        edit_window.geometry("400x500")
+        edit_window.configure(bg='#f8f9fa')
+        edit_window.resizable(False, False)
+
+        edit_window.transient(self.root)
+        edit_window.grab_set()
+
+        title_label = tk.Label(edit_window, text=f"Edit Product: {name}", 
+                              font=('Arial', 16, 'bold'), bg='#f8f9fa', fg='#2c3e50')
+        title_label.pack(pady=20)
+
+        form_frame = tk.Frame(edit_window, bg='#f8f9fa')
+        form_frame.pack(padx=40, fill=tk.BOTH, expand=True)
+
+        fields = [
+            ("Product Name:", "name", name),
+            ("Price ($):", "price", str(price)),
+            ("Quantity:", "quantity", str(quantity)),
+            ("Minimum Stock:", "min_stock", str(min_stock)),
+            ("Category:", "category", category if category else ""),
+            ("Description:", "description", description if description else "")
+        ]
+
+        entries = {}
+        for i, (label_text, field_name, default_value) in enumerate(fields):
+            label = tk.Label(form_frame, text=label_text, font=('Arial', 11), 
+                           bg='#f8f9fa', fg='#34495e')
+            label.grid(row=i, column=0, sticky='w', pady=8)
+            
+            if field_name == 'description':
+                text_widget = tk.Text(form_frame, font=('Arial', 11), width=25, height=4, 
+                                    relief=tk.FLAT, bd=5)
+                text_widget.grid(row=i, column=1, pady=8, padx=(10, 0), sticky='ew')
+                text_widget.insert('1.0', default_value)
+                entries[field_name] = text_widget
+            else:
+                entry = tk.Entry(form_frame, font=('Arial', 11), width=25, 
+                               relief=tk.FLAT, bd=5)
+                entry.grid(row=i, column=1, pady=8, padx=(10, 0), sticky='ew')
+                entry.insert(0, default_value)
+                entries[field_name] = entry
+        
+        form_frame.grid_columnconfigure(1, weight=1)
+
+        def validate_and_update():
+            try:
+                new_name = entries['name'].get().strip()
+                new_price_str = entries['price'].get().strip()
+                new_quantity_str = entries['quantity'].get().strip()
+                new_min_stock_str = entries['min_stock'].get().strip()
+                new_category = entries['category'].get().strip()
+                new_description = entries['description'].get("1.0", "end-1c").strip()
+
+                if not new_name:
+                    raise ValueError("Product name cannot be empty.")
+                
+                try:
+                    new_price = float(new_price_str)
+                    if new_price <= 0:
+                        raise ValueError("Price must be greater than 0.")
+                except ValueError:
+                    raise ValueError("Price must be a valid number.")
+                
+                try:
+                    new_quantity = int(new_quantity_str)
+                    if new_quantity < 0:
+                        raise ValueError("Quantity cannot be negative.")
+                except ValueError:
+                    raise ValueError("Quantity must be a valid whole number.")
+                
+                try:
+                    new_min_stock = int(new_min_stock_str)
+                    if new_min_stock < 0:
+                        raise ValueError("Minimum stock cannot be negative.")
+                except ValueError:
+                    raise ValueError("Minimum stock must be a valid whole number.")
+
+                with self.db_lock: # Acquire lock for database write
+                    self.db_cursor.execute("""UPDATE products SET name = ?, price = ?, quantity = ?, min_stock = ?, category = ?, description = ? WHERE id = ?""",
+                                 (new_name, new_price, new_quantity, new_min_stock, new_category, new_description, product_id))
+                    self.db_conn.commit()
+
+                messagebox.showinfo("Success", f"Product '{new_name}' updated successfully!")
+                edit_window.destroy()
+                self.refresh_table()
+                self.update_status(f"Updated product: {new_name}")
+
+            except sqlite3.IntegrityError:
+                messagebox.showerror("Error", "Product name already exists! Please choose a unique name.")
+            except ValueError as e:
+                messagebox.showerror("Validation Error", str(e))
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to update product: {str(e)}")
+
+        btn_frame = tk.Frame(edit_window, bg='#f8f9fa')
+        btn_frame.pack(fill=tk.X, padx=40, pady=20)
+
+        update_btn = tk.Button(btn_frame, text="Update Product", command=validate_and_update,
+                              font=('Arial', 11, 'bold'), bg='#3498db', fg='white',
+                              padx=20, pady=8, relief=tk.FLAT, cursor='hand2')
+        update_btn.pack(side=tk.LEFT)
+
+        cancel_btn = tk.Button(btn_frame, text="Cancel", command=edit_window.destroy,
+                              font=('Arial', 11), bg='#95a5a6', fg='white',
+                              padx=20, pady=8, relief=tk.FLAT, cursor='hand2')
+        cancel_btn.pack(side=tk.RIGHT)
+
+        entries['name'].focus_set()
+    
     def remove_product(self):
         """Deletes selected product from the database with confirmation."""
         selected = self.tree.selection()
@@ -1126,16 +1452,12 @@ class InventoryApp:
         
         if result:
             try:
-                conn = sqlite3.connect('inventory.db')
-                c = conn.cursor()
-                
-                # Delete related sales records first due to foreign key constraint
-                c.execute("DELETE FROM sales WHERE product_id = ?", (product_id,))
-                # Then delete the product itself
-                c.execute("DELETE FROM products WHERE id = ?", (product_id,))
-                
-                conn.commit()
-                conn.close()
+                with self.db_lock: # Acquire lock for database write
+                    # Delete related sales records first due to foreign key constraint
+                    self.db_cursor.execute("DELETE FROM sales WHERE product_id = ?", (product_id,))
+                    # Then delete the product itself
+                    self.db_cursor.execute("DELETE FROM products WHERE id = ?", (product_id,))
+                    self.db_conn.commit()
                 
                 messagebox.showinfo("Success", f"Product '{product_name}' deleted successfully!")
                 self.refresh_table() # Update the displayed table
@@ -1154,22 +1476,19 @@ class InventoryApp:
             self.tree.delete(item)
         
         try:
-            conn = sqlite3.connect('inventory.db')
-            c = conn.cursor()
-            
-            # Construct SQL query with optional search filter
-            if search_filter:
-                # Search by name, category, or description
-                c.execute("""SELECT id, name, price, quantity, min_stock, category, description 
-                           FROM products 
-                           WHERE LOWER(name) LIKE ? OR LOWER(category) LIKE ? OR LOWER(description) LIKE ?
-                           ORDER BY id""", 
-                          (f'%{search_filter}%', f'%{search_filter}%', f'%{search_filter}%'))
-            else:
-                c.execute("SELECT id, name, price, quantity, min_stock, category, description FROM products ORDER BY id")
-            
-            products = c.fetchall()
-            conn.close()
+            with self.db_lock: # Acquire lock for database read
+                # Construct SQL query with optional search filter
+                if search_filter:
+                    # Search by name, category, or description
+                    self.db_cursor.execute("""SELECT id, name, price, quantity, min_stock, category, description 
+                               FROM products 
+                               WHERE LOWER(name) LIKE ? OR LOWER(category) LIKE ? OR LOWER(description) LIKE ?
+                               ORDER BY id""", 
+                              (f'%{search_filter}%', f'%{search_filter}%', f'%{search_filter}%'))
+                else:
+                    self.db_cursor.execute("SELECT id, name, price, quantity, min_stock, category, description FROM products ORDER BY id")
+                
+                products = self.db_cursor.fetchall()
             
             # Insert products into the treeview
             for product in products:
@@ -1229,11 +1548,10 @@ class InventoryApp:
                 bg='#f8f9fa', fg='#34495e').grid(row=0, column=0, sticky='w', pady=10)
         
         # Fetch products currently in stock for the dropdown
-        conn = sqlite3.connect('inventory.db')
-        c = conn.cursor()
-        c.execute("SELECT id, name, quantity, price FROM products WHERE quantity > 0 ORDER BY name")
-        available_products = c.fetchall()
-        conn.close()
+        available_products = []
+        with self.db_lock: # Acquire lock for database read
+            self.db_cursor.execute("SELECT id, name, quantity, price FROM products WHERE quantity > 0 ORDER BY name")
+            available_products = self.db_cursor.fetchall()
         
         if not available_products:
             messagebox.showwarning("No Products", "No products currently available for sale in stock.")
@@ -1343,21 +1661,17 @@ class InventoryApp:
                     return # User cancelled
                 
                 # Database transaction for recording sale and updating inventory
-                conn = sqlite3.connect('inventory.db')
-                c = conn.cursor()
-                
-                # Record the sale in the sales table
-                c.execute("""INSERT INTO sales 
-                           (product_id, product_name, quantity, unit_price, total_amount) 
-                           VALUES (?, ?, ?, ?, ?)""",
-                         (product_id, name, quantity, price, total_amount))
-                
-                # Update the product quantity in the products table
-                c.execute("UPDATE products SET quantity = quantity - ? WHERE id = ?",
-                         (quantity, product_id))
-                
-                conn.commit()
-                conn.close()
+                with self.db_lock: # Acquire lock for database write
+                    # Record the sale in the sales table
+                    self.db_cursor.execute("""INSERT INTO sales 
+                                       (product_id, product_name, quantity, unit_price, total_amount) 
+                                       VALUES (?, ?, ?, ?, ?)""",
+                                      (product_id, name, quantity, price, total_amount))
+                    
+                    # Update the product quantity in the products table
+                    self.db_cursor.execute("UPDATE products SET quantity = quantity - ? WHERE id = ?",
+                                         (quantity, product_id))
+                    self.db_conn.commit()
                 
                 messagebox.showinfo("Success", f"Sale recorded successfully!\nTotal: ${total_amount:.2f}")
                 sale_window.destroy() # Close sale window
@@ -1491,15 +1805,15 @@ class InventoryApp:
                 sales_tree.column(col, width=col_widths[col], anchor='center')
             
             # Fetch product details for scanned barcodes
-            conn = sqlite3.connect('inventory.db')
-            c = conn.cursor()
             
             total_sale_amount = 0
             scanned_product_details = {} # Store actual product details for processing
             
             for barcode, scanned_qty in sales_data.items():
-                c.execute("SELECT id, name, price, quantity FROM products WHERE barcode = ?", (barcode,))
-                product = c.fetchone()
+                product = None
+                with self.db_lock: # Acquire lock for database read
+                    self.db_cursor.execute("SELECT id, name, price, quantity FROM products WHERE barcode = ?", (barcode,))
+                    product = self.db_cursor.fetchone()
                 
                 if product:
                     product_id, name, price, current_stock = product
@@ -1547,8 +1861,6 @@ class InventoryApp:
             def process_quick_sale():
                 """Processes the aggregated sales from quick scan."""
                 try:
-                    conn = sqlite3.connect('inventory.db')
-                    c = conn.cursor()
                     
                     total_processed_amount = 0
                     issues_found = []
@@ -1566,19 +1878,19 @@ class InventoryApp:
                         
                         subtotal = price * scanned_qty
                         
-                        # Record sale
-                        c.execute("""INSERT INTO sales 
-                                   (product_id, product_name, quantity, unit_price, total_amount) 
-                                   VALUES (?, ?, ?, ?, ?)""",
-                                 (product_id, name, scanned_qty, price, subtotal))
-                        
-                        # Update inventory
-                        c.execute("UPDATE products SET quantity = quantity - ? WHERE id = ?",
-                                 (scanned_qty, product_id))
+                        with self.db_lock: # Acquire lock for database write
+                            # Record sale
+                            self.db_cursor.execute("""INSERT INTO sales 
+                                               (product_id, product_name, quantity, unit_price, total_amount) 
+                                               VALUES (?, ?, ?, ?, ?)""",
+                                              (product_id, name, scanned_qty, price, subtotal))
+                            
+                            # Update inventory
+                            self.db_cursor.execute("UPDATE products SET quantity = quantity - ? WHERE id = ?",
+                                                 (scanned_qty, product_id))
+                            self.db_conn.commit()
                         total_processed_amount += subtotal
                         
-                    conn.commit()
-                    conn.close()
                     
                     if issues_found:
                         messagebox.showwarning("Sales with Issues", 
@@ -1610,7 +1922,6 @@ class InventoryApp:
                                   padx=20, pady=8, relief=tk.FLAT, cursor='hand2')
             cancel_btn.pack(side=tk.RIGHT)
             
-            conn.close() # Close DB connection
             
         # Initial window for quick scan, prompts to start camera
         sales_window = tk.Toplevel(self.root)
@@ -1647,14 +1958,13 @@ class InventoryApp:
         title_label.pack(pady=20)
         
         # Query low stock products (quantity <= min_stock)
-        conn = sqlite3.connect('inventory.db')
-        c = conn.cursor()
-        c.execute("""SELECT name, quantity, min_stock, price, category 
-                   FROM products 
-                   WHERE quantity <= min_stock 
-                   ORDER BY (quantity - min_stock), name""") # Order by most critical shortage
-        low_stock_products = c.fetchall()
-        conn.close()
+        low_stock_products = []
+        with self.db_lock: # Acquire lock for database read
+            self.db_cursor.execute("""SELECT name, quantity, min_stock, price, category 
+                               FROM products 
+                               WHERE quantity <= min_stock 
+                               ORDER BY (quantity - min_stock), name""") # Order by most critical shortage
+            low_stock_products = self.db_cursor.fetchall()
         
         if not low_stock_products:
             tk.Label(alert_window, text="✅ All products are adequately stocked!", 
@@ -1760,38 +2070,39 @@ class InventoryApp:
         """Generates and displays comprehensive sales reports and charts."""
         try:
             # Query sales data from the database
-            conn = sqlite3.connect('inventory.db')
-            c = conn.cursor()
+            daily_sales = []
+            product_sales = []
+            overall_stats = None
             
-            # Daily sales summary (last 30 days)
-            c.execute("""SELECT DATE(sale_date) as sale_day, 
-                               SUM(quantity) as total_items, 
-                               SUM(total_amount) as total_revenue
-                        FROM sales 
-                        GROUP BY DATE(sale_day) 
-                        ORDER BY sale_day DESC 
-                        LIMIT 30""")
-            daily_sales = c.fetchall()
+            with self.db_lock: # Acquire lock for database read
+                # Daily sales summary (last 30 days)
+                self.db_cursor.execute("""SELECT DATE(sale_date) as sale_day, 
+                                   SUM(quantity) as total_items, 
+                                   SUM(total_amount) as total_revenue
+                            FROM sales 
+                            GROUP BY DATE(sale_day) 
+                            ORDER BY sale_day DESC 
+                            LIMIT 30""")
+                daily_sales = self.db_cursor.fetchall()
+                
+                # Product-wise sales performance
+                self.db_cursor.execute("""SELECT product_name, 
+                                   SUM(quantity) as total_sold, 
+                                   SUM(total_amount) as revenue,
+                                   AVG(unit_price) as avg_price
+                            FROM sales 
+                            GROUP BY product_name 
+                            ORDER BY total_sold DESC""")
+                product_sales = self.db_cursor.fetchall()
+                
+                # Overall sales statistics
+                self.db_cursor.execute("""SELECT COUNT(*) as total_transactions,
+                                   SUM(quantity) as total_items_sold,
+                                   SUM(total_amount) as total_revenue,
+                                   AVG(total_amount) as avg_transaction
+                            FROM sales""")
+                overall_stats = self.db_cursor.fetchone()
             
-            # Product-wise sales performance
-            c.execute("""SELECT product_name, 
-                               SUM(quantity) as total_sold, 
-                               SUM(total_amount) as revenue,
-                               AVG(unit_price) as avg_price
-                        FROM sales 
-                        GROUP BY product_name 
-                        ORDER BY total_sold DESC""")
-            product_sales = c.fetchall()
-            
-            # Overall sales statistics
-            c.execute("""SELECT COUNT(*) as total_transactions,
-                               SUM(quantity) as total_items_sold,
-                               SUM(total_amount) as total_revenue,
-                               AVG(total_amount) as avg_transaction
-                        FROM sales""")
-            overall_stats = c.fetchone()
-            
-            conn.close()
             
             # Create report window
             report_window = tk.Toplevel(self.root)
@@ -2089,8 +2400,9 @@ INSTALLATION AND SETUP INSTRUCTIONS:
 4. TESTING CHECKLIST:
    ✓ Add products manually with various prices and quantities.
    ✓ Test 'AI Add Product' by pointing your camera at various objects (books, food, etc.). 
-     Verify if it fills details and suggests min_stock.
-   ✓ Test 'Scan Add Product' by scanning barcodes. Verify product lookup and addition.
+     Verify if it fills details and suggests min_stock. It should now also prompt you to consolidate quantity if a similar product is found.
+   ✓ Test 'Scan Add Product' by scanning barcodes. Verify product lookup and addition. 
+     If a product from a barcode scan has a similar name to an AI-added product (and no barcode is in DB), it should prompt to merge and add quantity.
    ✓ Record sales manually and verify stock deduction.
    ✓ Test 'Quick Scan Sale' by scanning multiple barcodes (real or printed).
      Verify correct quantity deduction and sales recording.
@@ -2102,8 +2414,8 @@ INSTALLATION AND SETUP INSTRUCTIONS:
    ✓ Observe color coding for stock levels (red=out, orange=low, green=good).
 
 5. FEATURES INCLUDED:
-   ✓ AI-powered product addition via image recognition (Gemini Vision API)
-   ✓ Barcode scanning for automated product addition and quick sales (OpenCV, pyzbar, online APIs)
+   ✓ AI-powered product addition via image recognition (Gemini Vision API) with intelligent duplicate detection and quantity consolidation
+   ✓ Barcode scanning for automated product addition and quick sales (OpenCV, pyzbar, online APIs) with intelligent duplicate detection for AI-added products
    ✓ Modern, responsive UI with color coding
    ✓ Complete CRUD operations for products
    ✓ Real-time stock tracking and validation
